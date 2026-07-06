@@ -125,7 +125,7 @@ The biologists collected 3 movies (experiments 0, 1, and 2).
 ```{r load-plot-infection-example}
 # example of loading and plotting data:
 
-output <- py_load_object("infection_with_drug_experiment_2.pkl")
+output <- py_load_object("/Applications/mism-hackathon/data/raw/infection_with_drug_experiment_0.pkl")
 
 A_list   <- output$A_list
 metadata <- output$metadata
@@ -158,6 +158,13 @@ legend("topright", inset = c(-0.3, 0),
        legend = c("Susceptible", "Infected", "Recovered"),
        fill = cmap[2:4], xpd = TRUE, bty = "n")
 ```
+
+
+
+```{r}
+tracks = read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_no_drug_0.csv")
+```
+
 
 ```{r}
 library(clue)   # solve_LSAP = Hungarian algorithm
