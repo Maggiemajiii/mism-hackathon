@@ -1,4 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ---- R (kept from original) ----
 .Rproj.user
 .Rhistory
 .RData
 .Ruserdata
+
+# ---- data blobs (kept locally, not committed) ----
+data/processed/
+
+# ---- generated results ----
+project/**/results/*.png
+project/**/results/*.csv
+project/**/results/*.json
+
+# ---- OS ----
+.DS_Store
