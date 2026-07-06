@@ -124,16 +124,37 @@ plot_tracks <- function(tracks, L, main = "", file = NULL) {
 # --- tidy exports ------------------------------------------------------------
 # The trajectories as a long ("tidy") data frame: one row per (cell, frame).
 # This is `tr$pos` unrolled -- cell i is the same cell at every frame.
-tracks_to_df <- function(tracks, dt = 1) {
+#
+# Pass the raw movie `A` to also attach each cell's STATE. Tracking only assigns
+# identity (the cell index); the S/I/R value is read verbatim from the frames at
+# the cell's tracked lattice site -- it is ground truth from the data, not
+# inferred. (For the 0/1 migration movies the state is just 1 = cell.)
+tracks_to_df <- function(tracks, dt = 1, A = NULL, L = NULL) {
   pos <- tracks$pos
   Tn <- dim(pos)[1]; N <- dim(pos)[2]
-  data.frame(
+  df <- data.frame(
     cell  = rep(seq_len(N), each = Tn),
     frame = rep(seq_len(Tn), times = N),
     t_min = rep(seq_len(Tn) - 1, times = N) * dt,
     x     = as.vector(pos[, , 1]),   # column-major: frame varies fastest within a cell
     y     = as.vector(pos[, , 2])
   )
+  if (!is.null(A)) {
+    if (is.null(L)) L <- nrow(get_frame(A, 1))
+    # tracked positions are integer lattice sites (possibly unwrapped); wrap them
+    # back into 1..L and read the state at fr[row, col] = fr[x, y].
+    xi <- ((round(df$x) - 1) %% L) + 1
+    yi <- ((round(df$y) - 1) %% L) + 1
+    st <- integer(nrow(df))
+    for (t in seq_len(Tn)) {
+      fr  <- get_frame(A, t)
+      sel <- which(df$frame == t)
+      st[sel] <- fr[cbind(xi[sel], yi[sel])]
+    }
+    df$state       <- st
+    df$state_label <- factor(st, levels = 0:3, labels = c("empty", "S", "I", "R"))
+  }
+  df
 }
 
 # The LINKS as a long data frame: one row per (cell, frame t -> t+1). Each row is

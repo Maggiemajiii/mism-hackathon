@@ -61,9 +61,18 @@ lattice site. Motility (~0.40 µm/min) is essentially identical across drug and
 no-drug and across the three replicates, so **the drug acts on transmission, not
 on movement** — which is exactly the assumption the SIR/spread analysis relies on.
 
-## Next step
+## Trajectory + state output
 
-Because the cells barely move and tracking is reliable, you can safely attach each
-cell's **state trajectory** (S→I→R over time) to its position track and analyse
-*when* and *near whom* each infection happens — the natural bridge from this
-motility baseline to the transmission analysis.
+`results/trajectory_no_drug_0.csv` is the tidy trajectory table, one row per
+(cell, frame): `cell, frame, t_min, x, y, state, state_label`. Tracking supplies
+only the **identity** (`cell`); the `state` (0/1/2/3 = empty/S/I/R) is read
+verbatim from the frames at each cell's tracked site — ground truth from the data,
+not inferred. Every tracked site is occupied, so `state` is always S/I/R.
+
+A useful side effect: a physically valid cell only ever goes S→I→R. If a cell's
+`state` jumps *backward* (e.g. R→S), that frame is almost certainly a tracking
+mislink — a free correctness check on the linker (~120/161 cells are clean).
+
+This table is the bridge from the motility baseline to the transmission analysis:
+with each cell's S→I→R timing and position you can ask *when* and *near whom* every
+infection happens.
