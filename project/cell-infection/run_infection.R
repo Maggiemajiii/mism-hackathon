@@ -77,14 +77,19 @@ plot_tracks(tracks[["no_drug_0"]], L = 40,
             main = "Infection assay, no drug (exp 0) -- reconstructed tracks",
             file = file.path(script_dir, "results", "tracks_infection_no_drug_0.png"))
 
-# --- save the trajectory as a tidy data frame --------------------------------
-# `tr$pos` unrolled to one row per (cell, frame): cell, frame, t_min, x, y.
-traj <- tracks_to_df(tracks[["no_drug_0"]], dt = 0.5)
+# --- save the trajectory as a tidy data frame, WITH S/I/R state --------------
+# columns: cell, frame, t_min, x, y, state (0/1/2/3), state_label (empty/S/I/R).
+# Reload this movie so we can read each cell's state from its frames; tracking
+# supplies only the identity (cell), the state comes straight from the data.
+A0   <- py_load_object(file.path(DATA, "infection_no_drug_experiment_0.pkl"))$A_list
+traj <- tracks_to_df(tracks[["no_drug_0"]], dt = 0.5, A = A0)
 write.csv(traj, file.path(script_dir, "results", "trajectory_no_drug_0.csv"),
           row.names = FALSE)
-cat(sprintf("\nTrajectory data frame: %d rows = %d cells x %d frames\n",
+cat(sprintf("\nTrajectory data frame: %d rows = %d cells x %d frames (with S/I/R state)\n",
             nrow(traj), length(unique(traj$cell)), length(unique(traj$frame))))
 print(utils::head(traj))
+cat("\nstate check (should be only S/I/R, never empty):\n")
+print(table(traj$state_label))
 
 # --- look at ONE link between frames (frame 1 -> 2), not the whole trajectory --
 plot_link(tracks[["no_drug_0"]], t = 1,
