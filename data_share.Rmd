@@ -1,0 +1,179 @@
+---
+title: "Data Share"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# reticulate is used to read the .pkl files directly (they were written from
+# Python/pickle). py_load_object() reads a pickle file and converts it to a
+# native R object (dict -> named list, numpy array -> R array).
+library(reticulate)
+
+# Helper: plot one discrete-state frame the way matplotlib's imshow does.
+# `mat` is a 2D matrix of integer codes (e.g. 0/1 or 0/1/2/3).
+# `cols` is a vector of colors, one per code, indexed from the minimum code.
+# plot_frame <- function(mat, cols, main = "") {
+#   codes <- sort(unique(as.vector(mat)))
+#   # image() plots row 1 at the bottom and transposes rows/cols relative to
+#   # how the matrix looks when printed, so flip/transpose to match imshow.
+#   mat_img <- t(mat[nrow(mat):1, ])
+#   image(
+#     mat_img,
+#     col = cols,
+#     breaks = seq(min(codes) - 0.5, max(codes) + 0.5, by = 1),
+#     axes = FALSE, main = main, asp = 1
+#   )
+# }
+
+plot_frame <- function(mat, cols, main = "") {
+  n <- length(cols)
+  # image() plots row 1 at the bottom and transposes rows/cols relative to
+  # how the matrix looks when printed, so flip/transpose to match imshow.
+  mat_img <- t(mat[nrow(mat):1, ])
+  image(
+    mat_img,
+    col = cols,
+    breaks = seq(-0.5, n - 0.5, by = 1),
+    zlim = c(0, n - 1),
+    axes = FALSE, main = main, asp = 1
+  )
+}
+
+extract_frame <- function(A_list, i) {
+  if (is.list(A_list) && !is.array(A_list)) {
+    mat <- A_list[[i]]
+  } else {
+    mat <- A_list[i, , ]
+  }
+  as.matrix(mat)
+}
+```
+
+# Project 1: quantifying cell movement from microscopy data
+
+### dataset 1.1: cells moving with no drug added
+
+migration_no_drug_low_density.pkl,
+migration_no_drug_med_density.pkl,
+migration_no_drug_high_density.pkl
+
+Cell centroids are saved in `A_list`, which has shape (t, x, y). For each
+time point t, there is a spatial field of cells in the xy-plane, where 1's
+denote location of cells. See metadata for spatial length scale and interval
+between time points.
+
+```{r load-plot-migration-example}
+# example of loading and plotting data:
+library(tweenr)
+output <- py_load_object("migration_no_drug_med_density.pkl")
+
+A_list   <- output$A_list
+metadata <- output$metadata
+
+cat("Size of data (t, 2D position): ", paste(dim(A_list), collapse = " x "), "\n")
+cat("\nData Details:\n")
+for (key in names(metadata)) {
+  cat(key, "-", as.character(metadata[[key]]), "\n")
+}
+
+# discrete colormap: 0 = empty (white), 1 = cell (blue)
+cmap <- c("white", "blue")
+
+par(mfrow = c(1, 3), mar = c(1, 1, 2, 1))
+for (i in 1:3) {
+  plot_frame(extract_frame(A_list, i), cols = cmap, main = paste("t =", i - 1))
+}
+legend("topright", inset = c(-0.2, 0), legend = "cells", fill = "blue",
+       xpd = TRUE, bty = "n")
+```
+
+#### dataset 1.2: cells moving with drug added
+
+migration_with_drug_low_density.pkl,
+migration_with_drug_med_density.pkl,
+migration_with_drug_high_density.pkl
+
+Cell centroids are saved saved in `A_list`, which has shape (t, x, y). For
+each time point t, there is a spatial field of cells in the xy-plane, where
+1's denote location of cells. See metadata for spatial length scale and
+interval between time points.
+
+```{r load-plot-migration-drug}
+# load and plot like above
+```
+
+# Project 2: determining effect of drug on cell-to-cell virus transmission
+
+#### dataset 2.1: virus spreading with no drug added
+
+infection_no_drug_experiment_0.pkl,
+infection_no_drug_experiment_1.pkl,
+infection_no_drug_experiment_2.pkl
+
+Cell centroids are again saved in `A_list`, which has shape (t, x, y). For
+each time point t, there is a spatial field of cells in the xy-plane, where
+each value encodes the cell's state: 0 = no cell, 1 = susceptible cell,
+2 = infected cell, 3 = recovered cell. For example, `A_list[t, x, y] == 2`
+means the cell at position (x, y) is infected at frame t.
+
+See metadata for spatial length scale and interval between time points.
+
+The biologists collected 3 movies (experiments 0, 1, and 2).
+
+```{r load-plot-infection-example}
+# example of loading and plotting data:
+
+output <- py_load_object("infection_no_drug_experiment_0.pkl")
+
+A_list   <- output$A_list
+metadata <- output$metadata
+
+cat("Size of data (t, 2D position): ", paste(dim(A_list), collapse = " x "), "\n")
+cat("\nData Details:\n")
+for (key in names(metadata)) {
+  cat(key, "-", as.character(metadata[[key]]), "\n")
+}
+
+# discrete colormap: one color per state (0=empty, 1=S, 2=I, 3=R)
+cmap <- c(
+  "white",                    # 0 empty
+  "blue",                     # 1 susceptible
+  rgb(0, 200 / 256, 0),       # 2 infected
+  "black"                     # 3 recovered
+)
+
+
+times_to_plot <- c(0, 20, 40)   # 0-indexed, as in the Python version
+
+par(mfrow = c(1, length(times_to_plot)), mar = c(1, 1, 2, 1))
+for (t in times_to_plot) {
+ plot_frame(extract_frame(A_list, t + 1), cols = cmap, main = paste("t =", t))
+}
+legend("topright", inset = c(-0.3, 0),
+       legend = c("Susceptible", "Infected", "Recovered"),
+       fill = cmap[2:4], xpd = TRUE, bty = "n")
+```
+
+#### dataset 2.2: virus spreading with drug added
+
+infection_with_drug_experiment_0.pkl
+infection_with_drug_experiment_1.pkl
+infection_with_drug_experiment_2.pkl
+
+Cell centroids are again saved in `A_list`, which has shape (t, x, y). For
+each time point t, there is a spatial field of cells in the xy-plane, where
+each value encodes the cell's state: 0 = no cell, 1 = susceptible cell,
+2 = infected cell, 3 = recovered cell. For example, `A_list[t, x, y] == 2`
+means the cell at position (x, y) is infected at frame t.
+
+See metadata for spatial length scale and interval between time points.
+
+The biologists collected 3 movies (experiments 0, 1, and 2).
+
+```{r load-plot-infection-drug}
+# load and plot like above
+```
