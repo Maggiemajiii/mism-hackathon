@@ -1,0 +1,304 @@
+---
+title: "bonus"
+output: pdf_document
+date: "2026-07-07"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+## =========================================================================
+## fit_spatial_sir(): full pipeline
+##   - builds transmission/recovery datasets from before/after-drug tracks
+##   - fits MLE (bbmle::mle2), prints convergence code
+##   - fits Bayesian posterior (mcmc::metrop), auto-tuning acceptance rate
+##   - returns both sets of estimates
+##   - produces 5 plots:
+##       1. df_before, simulated (MLE params)     vs observed I(t)
+##       2. df_before, simulated (Bayesian params) vs observed I(t)
+##       3. df_after,  simulated (MLE params)     vs observed I(t)
+##       4. df_after,  simulated (Bayesian params) vs observed I(t)
+##       5. parameter estimates: MLE (dark grey) vs Bayesian (dark orange),
+##          with a vertical dashed line at 0, one row per parameter
+## =========================================================================
+
+library(dplyr)
+library(bbmle)
+library(mcmc)
+library(ggplot2)
+
+fit_spatial_sir_short <- function(df_before, df_after, delta = 1, mult_start = 9,
+                             n_mcmc = 5000, n_sims = 30, burn = 1000,
+                             tune_target = c(0.2, 0.4), tune_max_iter = 15) {
+
+  ## ---- 0. Combine data ----
+  df_before$drug <- 0
+  df_after$drug  <- 1
+  tracks <- bind_rows(df_before, df_after) %>% arrange(drug, cell, frame)
+
+  ## ---- 1. Build transmission blocks (distance matrices, precomputed once) ----
+  build_transmission_blocks <- function(tracks, delta) {
+    blocks <- list(); k <- 1
+    for (d in unique(tracks$drug)) {
+      sub <- tracks %>% filter(drug == d)
+      frames <- sort(unique(sub$frame))
+      for (t in frames) {
+        if (!(t + delta) %in% frames) next
+        now <- sub %>% filter(frame == t)
+        nxt <- sub %>% filter(frame == t + delta) %>% select(cell, state_next = state)
+        susc <- now %>% filter(state == 1) %>% left_join(nxt, by = "cell")
+        inf  <- now %>% filter(state == 2)
+        if (nrow(susc) == 0 || nrow(inf) == 0) next
+        D <- sqrt(outer(susc$x, inf$x, "-")^2 + outer(susc$y, inf$y, "-")^2)
+        blocks[[k]] <- list(D = D, became_infected = as.numeric(susc$state_next == 2), drug = d)
+        k <- k + 1
+      }
+    }
+    blocks
+  }
+
+  build_recovery_data <- function(tracks, delta) {
+    out <- list(); k <- 1
+    for (d in unique(tracks$drug)) {
+      sub <- tracks %>% filter(drug == d)
+      frames <- sort(unique(sub$frame))
+      for (t in frames) {
+        if (!(t + delta) %in% frames) next
+        now <- sub %>% filter(frame == t, state == 2)
+        nxt <- sub %>% filter(frame == t + delta) %>% select(cell, state_next = state)
+        if (nrow(now) == 0) next
+        now <- now %>% left_join(nxt, by = "cell")
+        out[[k]] <- data.frame(became_removed = as.numeric(now$state_next == 3), drug = d)
+        k <- k + 1
+      }
+    }
+    bind_rows(out)
+  }
+
+  trans_blocks <- build_transmission_blocks(tracks, delta)
+  recov_df     <- build_recovery_data(tracks, delta)
+
+  cat("Number of (frame, condition) transmission blocks:", length(trans_blocks), "\n")
+  cat("Number of recovery observations:", nrow(recov_df), "\n")
+
+  ## ---- 2. Negative log-likelihood ----
+  nll <- function(log_beta1, log_phi, betaD, log_gamma, gammaD) {
+    beta1 <- exp(log_beta1); phi <- exp(log_phi); gamma <- exp(log_gamma)
+
+    ll_trans <- 0
+    for (blk in trans_blocks) {
+      kappa_sum <- rowSums(exp(-blk$D / phi))
+      lambda    <- beta1 * exp(betaD * blk$drug) * kappa_sum
+      p_inf     <- 1 - exp(-lambda * delta)
+      p_inf     <- pmin(pmax(p_inf, 1e-10), 1 - 1e-10)
+      ll_trans  <- ll_trans + sum(dbinom(blk$became_infected, 1, p_inf, log = TRUE))
+    }
+
+    p_rec  <- 1 - exp(-gamma * exp(gammaD * recov_df$drug) * delta)
+    p_rec  <- pmin(pmax(p_rec, 1e-10), 1 - 1e-10)
+    ll_rec <- sum(dbinom(recov_df$became_removed, 1, p_rec, log = TRUE))
+
+    -(ll_trans + ll_rec)
+  }
+
+  ## ---- 3. MLE fit ----
+  start_vals <- list(log_beta1 = log(0.01), log_phi = log(3), betaD = 0,
+                      log_gamma = log(0.02), gammaD = 0)
+
+  fit <- mle2(nll, start = start_vals, method = "BFGS", control = list(maxit = 500))
+
+  cat("\nMLE convergence code (0 = converged):\n")
+  print(fit@details$convergence)
+
+  mle_est <- coef(fit)
+  mle_se  <- sqrt(diag(vcov(fit)))
+
+  ## ---- 4. Bayesian fit: Metropolis-Hastings via mcmc::metrop ----
+  log_posterior <- function(par) {
+    log_beta1 <- par[1]; log_phi <- par[2]; betaD <- par[3]
+    log_gamma <- par[4]; gammaD <- par[5]
+
+    ll <- -nll(log_beta1, log_phi, betaD, log_gamma, gammaD)
+
+    lp <- dnorm(log_beta1, log(0.01), 3, log = TRUE) +
+          dnorm(log_phi,   log(3),    3, log = TRUE) +
+          dnorm(betaD,     0,         5, log = TRUE) +
+          dnorm(log_gamma, log(0.02), 3, log = TRUE) +
+          dnorm(gammaD,    0,         5, log = TRUE)
+
+    ll + lp
+  }
+
+  init  <- coef(fit)
+  Sigma <- vcov(fit)
+
+  # Tune proposal scale toward target acceptance rate by CONTINUING the
+  # chain (not restarting), matching the confirmed-working manual approach.
+  mult <- mult_start
+  out <- metrop(log_posterior, initial = init, nbatch = 1000, scale = Sigma * mult)
+  for (i in 1:tune_max_iter) {
+    acc <- out$accept
+    if (acc >= tune_target[1] && acc <= tune_target[2]) break
+    mult <- mult * ifelse(acc > tune_target[2], 1.5, 0.7)
+    out <- metrop(out, scale = Sigma * mult)
+  }
+  cat("\nTuned MCMC acceptance rate:", round(out$accept, 3),
+      "(scale multiplier:", round(mult, 3), ")\n")
+
+  # Production run: continue from the tuned chain (do NOT restart from init;
+  # continuing is what's been confirmed to work).
+  out_long <- metrop(out, nbatch = n_mcmc, scale = Sigma * mult)
+  cat("Final long-run acceptance rate:", round(out_long$accept, 3), "\n")
+
+  post <- as.data.frame(out_long$batch)
+  colnames(post) <- names(init)
+  post <- post[-(1:min(burn, nrow(post) - 1)), ]
+
+  bayes_mean <- colMeans(post)
+  bayes_ci   <- apply(post, 2, quantile, probs = c(0.025, 0.975))
+
+return(t(rbind(bayes_mean, bayes_ci)))
+}
+
+
+```
+
+
+```{r}
+bonus = function(df_before, df_after)
+{
+  n_spans <- 20
+before <- vector("list", n_spans)
+after  <- vector("list", n_spans)
+fits   <- vector("list", n_spans)
+time_span_vec <- numeric(n_spans)
+
+for (k in 1:n_spans) {
+  time_span_vec[k] <- k * 0.5   # 0.5, 1.0, 1.5, 2.0, ..., 5.0
+
+  b <- df_before %>% filter((frame - 1) %% k == 0) %>% arrange(cell, t_min)
+  a <- df_after  %>% filter((frame - 1) %% k == 0) %>% arrange(cell, t_min)
+
+  # Renumber frame to be contiguous (1, 2, 3, ...) within each condition,
+  # so "next frame" (delta = 1) correctly refers to the next RETAINED
+  # time point, not the next raw frame index.
+  b <- b %>% group_by(cell) %>% mutate(frame = rank(t_min)) %>% ungroup()
+  a <- a %>% group_by(cell) %>% mutate(frame = rank(t_min)) %>% ungroup()
+
+  before[[k]] <- b
+  after[[k]]  <- a
+
+  fits[[k]] <- fit_spatial_sir_short(
+    df_before = before[[k]], df_after = after[[k]], delta = 1,
+    mult_start = 9,
+    n_mcmc = 10000, n_sims = 50, burn = 2000,
+    tune_target = c(0.2, 0.3), tune_max_iter = 15
+  )
+}
+  return(fits)
+}
+
+
+df_before0 <- read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_no_drug_0.csv")
+df_after0  <- read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_with_drug_0.csv")
+run0 = bonus(df_before0, df_after0)
+run0
+
+df_before1 <- read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_no_drug_1.csv")
+df_after1  <- read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_with_drug_1.csv")
+run1 = bonus(df_before1, df_after1)
+run1
+
+df_before2 <- read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_no_drug_0.csv")
+df_after2  <- read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_with_drug_0.csv")
+run0 = bonus(df_before2, df_after2)
+run2
+
+```
+
+```{r}
+## =========================================================================
+## Plot each of the 5 model parameters (Bayesian mean + 95% CI) across a
+## sequence of fits[[i]] run at different effective time spans.
+## =========================================================================
+
+library(dplyr)
+library(purrr)
+library(ggplot2)
+
+param_names <- c("log_beta1", "log_phi", "betaD", "log_gamma", "gammaD")
+
+## -------------------------------------------------------------------------
+## 1. Extract bayes_mean + 95% CI from every fits[[i]] into one long data frame
+## -------------------------------------------------------------------------
+## time_span_vec: numeric vector, same length as `fits`, giving the actual
+## time span (in minutes, or whatever unit is meaningful) for each element.
+## e.g. if fits[[i]] corresponds to subsampling every i-th 0.5-min step,
+## time_span_vec <- (1:length(fits)) * 0.5
+
+extract_param_summary <- function(fits, time_span_vec,
+                                   param_names = c("log_beta1", "log_phi",
+                                                    "betaD", "log_gamma", "gammaD")) {
+  stopifnot(length(fits) == length(time_span_vec))
+
+  map_dfr(seq_along(fits), function(i) {
+    f <- fits[[i]]
+    data.frame(
+      time_span = time_span_vec[i],
+      param     = param_names,
+      mean      = unname(f[param_names, "bayes_mean"]),
+      lower     = unname(f[param_names, "2.5%"]),
+      upper     = unname(f[param_names, "97.5%"])
+    )
+  })
+}
+
+## -------------------------------------------------------------------------
+## 2. Build one plot per parameter: x = time_span, y = mean, error bar = 95% CI
+## -------------------------------------------------------------------------
+make_param_plot <- function(summary_df, param_name, ylab = param_name) {
+  df <- summary_df %>% filter(param == param_name)
+
+  ggplot(df, aes(x = time_span, y = mean)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15,
+                  color = "darkorange", linewidth = 0.8) +
+    geom_point(color = "black", size = 2) +
+    geom_line(color = "black", alpha = 0.4) +
+    labs(x = "Time span (min)", y = ylab,
+         title = paste("Bayesian estimate vs. time span:", param_name)) +
+    theme_minimal()
+}
+
+## -------------------------------------------------------------------------
+## 3. Usage
+## -------------------------------------------------------------------------
+ time_span_vec <- (1:length(fits)) * 0.5   # adjust to match how fits was built
+
+ summary_df <- extract_param_summary(frun0, time_span_vec)
+
+ plots <- setNames(
+   lapply(param_names, function(p) make_param_plot(summary_df, p)),
+   param_names
+ )
+
+plots$log_beta1
+plots$log_phi
+plots$betaD
+plots$log_gamma
+plots$gammaD
+
+## -------------------------------------------------------------------------
+## Optional: all 5 in one combined figure (requires patchwork)
+## -------------------------------------------------------------------------
+library(patchwork)
+combined <- plots$log_beta1 / plots$log_phi / plots$betaD /
+            plots$log_gamma / plots$gammaD
+combined
+```
+
+
+

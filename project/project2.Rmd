@@ -2,6 +2,8 @@
 title: "project_2"
 output: html_document
 date: "2026-07-06"
+editor_options: 
+  chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
@@ -162,27 +164,870 @@ legend("topright", inset = c(-0.3, 0),
 
 
 ```{r}
-tracks = read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_no_drug_0.csv")
+tracks_nodrug = read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_no_drug_0.csv")
+tracks
+```
+
+
+## Having the dataset for all 6 conditions
+
+
+```{r}
+tracks <- list()
+
+results_dir <- file.path(script_dir, "results")
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (cond in conditions) {
+  for (e in experiments) {
+
+    ## -----------------------
+    ## Load data
+    ## -----------------------
+    f   <- file.path(DATA,
+                     sprintf("infection_%s_experiment_%d.pkl", cond, e))
+
+    out <- py_load_object(f)
+    A   <- out$A_list
+
+    L <- as.integer(out$metadata[["xy dimensions"]])
+    if (length(L) == 0 || is.na(L))
+      L <- nrow(get_frame(A, 1))
+
+    dt <- as.numeric(out$metadata[["time interval (mins)"]])
+
+    ## -----------------------
+    ## Track cells
+    ## -----------------------
+    tr <- build_tracks(
+      A,
+      L,
+      periodic = TRUE,
+      solver = fast_solver,
+      state = NULL
+    )
+
+    d <- diagnostics(tr, L, periodic = TRUE)
+
+    step <- sqrt(tr$disp[, , 1]^2 + tr$disp[, , 2]^2)
+
+    frac_still <- mean(step == 0, na.rm = TRUE)
+    speed <- d$mean_step / dt
+
+    key <- paste(cond, e, sep = "_")
+    tracks[[key]] <- tr
+
+    cat(sprintf("%-10s %4d %6d %11.3f %11.3f %8.3f %9.3f %7.0f%%\n",
+                cond, e,
+                d$n_cells,
+                d$mean_step,
+                d$nn_spacing,
+                d$rho,
+                speed,
+                100 * frac_still))
+
+    ## -----------------------
+    ## Save trajectory plot
+    ## -----------------------
+    plot_tracks(
+      tr,
+      L = L,
+      main = sprintf("Infection assay: %s (exp %d)", cond, e),
+      file = file.path(
+        results_dir,
+        sprintf("tracks_infection_%s_%d.png", cond, e)
+      )
+    )
+
+    ## -----------------------
+    ## Save trajectory dataframe
+    ## -----------------------
+    traj <- tracks_to_df(
+      tr,
+      dt = dt,
+      A = A
+    )
+
+    write.csv(
+      traj,
+      file.path(
+        results_dir,
+        sprintf("trajectory_%s_%d.csv", cond, e)
+      ),
+      row.names = FALSE
+    )
+
+    ## -----------------------
+    ## Save one frame-to-frame link
+    ## -----------------------
+    plot_link(
+      tr,
+      t = 1,
+      file = file.path(
+        results_dir,
+        sprintf("link_%s_%d_frame1.png", cond, e)
+      )
+    )
+
+    ## -----------------------
+    ## Console summary
+    ## -----------------------
+    cat(sprintf(
+      "\nSaved outputs for %s experiment %d\n",
+      cond, e
+    ))
+
+    cat(sprintf(
+      "Trajectory: %d rows (%d cells × %d frames)\n",
+      nrow(traj),
+      length(unique(traj$cell)),
+      length(unique(traj$frame))
+    ))
+
+    print(table(traj$state_label))
+    cat("\n--------------------------------------------\n")
+  }
+}
+
+cat("\nFinished processing all six infection datasets.\n")
 ```
 
 
 ```{r}
-library(clue)   # solve_LSAP = Hungarian algorithm
+## =========================================================================
+## Spatial SIR hazard model for cell-tracking data (before/after drug)
+## =========================================================================
+## Expected input: two data.frames, each with columns
+##   cell        : cell ID (1..161)
+##   frame       : 1..401
+##   t_min       : seq(0, 200, 0.5)
+##   x, y        : coordinates
+##   state       : 1 = S, 2 = I, 3 = R
+##   state_label : text label (not used in fitting)
+##
+## Model:
+##   lambda_i(t) = beta1 * exp(betaD * drug) * sum_{j in I(t)} exp(-d_ij(t)/phi)
+##   P(S_i -> I_i in [t, t+delta)) = 1 - exp(-lambda_i(t) * delta)
+##   P(I_i -> R_i in [t, t+delta)) = 1 - exp(-gamma * exp(gammaD * drug) * delta)
+## =========================================================================
 
-link_frames <- function(frame_t, frame_t1, max_dist) {
-  n1 <- nrow(frame_t); n2 <- nrow(frame_t1)
-  D  <- as.matrix(dist(rbind(frame_t[, c("x","y")], frame_t1[, c("x","y")])))
-  D  <- D[1:n1, (n1 + 1):(n1 + n2), drop = FALSE]
+library(dplyr)
+library(bbmle)
 
-  cost <- D
-  cost[cost > max_dist] <- 1e6   # disallow biologically implausible jumps
+## -------------------------------------------------------------------------
+## 0. Load and stack the two datasets
+## -------------------------------------------------------------------------
+# df_before <- read.csv("before_drug.csv")
+# df_after  <- read.csv("after_drug.csv")
 
-  assignment <- solve_LSAP(cost)     # optimal one-to-one match, min total distance
-  idx_t1     <- as.integer(assignment)
-  dist_val   <- D[cbind(seq_len(n1), idx_t1)]
-  idx_t1[dist_val > max_dist] <- NA   # treat as lost/new cell instead of forcing a bad match
+df_before$drug <- 0
+df_after$drug  <- 1
 
-  data.frame(idx_t = seq_len(n1), idx_t1 = idx_t1, dist = dist_val)
+tracks <- bind_rows(df_before, df_after) %>%
+  arrange(drug, cell, frame)
+
+delta <- 1   # 1 frame = 0.5 min; hazard/rate parameters will be in units of "per frame"
+
+## -------------------------------------------------------------------------
+## 1. Precompute, for every (drug condition, frame), the distance matrix
+##    between susceptible cells and infected cells, plus the outcome
+##    (did each susceptible cell become infected by the next frame?)
+##    Distances don't depend on model parameters, so this is done ONCE.
+## -------------------------------------------------------------------------
+build_transmission_blocks <- function(tracks, delta = 1) {
+  blocks <- list()
+  k <- 1
+
+  for (d in unique(tracks$drug)) {
+    sub <- tracks %>% filter(drug == d)
+    frames <- sort(unique(sub$frame))
+
+    for (t in frames) {
+      if (!(t + delta) %in% frames) next
+
+      now <- sub %>% filter(frame == t)
+      nxt <- sub %>% filter(frame == t + delta) %>% select(cell, state_next = state)
+
+      susc <- now %>% filter(state == 1) %>% left_join(nxt, by = "cell")
+      inf  <- now %>% filter(state == 2)
+
+      if (nrow(susc) == 0 || nrow(inf) == 0) next
+
+      D <- sqrt(outer(susc$x, inf$x, "-")^2 + outer(susc$y, inf$y, "-")^2)
+      # D: rows = susceptible cells, cols = currently infected cells
+
+      blocks[[k]] <- list(
+        D = D,
+        became_infected = as.numeric(susc$state_next == 2),
+        drug = d
+      )
+      k <- k + 1
+    }
+  }
+  blocks
 }
+
+## -------------------------------------------------------------------------
+## 2. Recovery data (I -> R), no distance needed
+## -------------------------------------------------------------------------
+build_recovery_data <- function(tracks, delta = 1) {
+  out <- list()
+  k <- 1
+
+  for (d in unique(tracks$drug)) {
+    sub <- tracks %>% filter(drug == d)
+    frames <- sort(unique(sub$frame))
+
+    for (t in frames) {
+      if (!(t + delta) %in% frames) next
+
+      now <- sub %>% filter(frame == t, state == 2)
+      nxt <- sub %>% filter(frame == t + delta) %>% select(cell, state_next = state)
+      if (nrow(now) == 0) next
+
+      now <- now %>% left_join(nxt, by = "cell")
+      out[[k]] <- data.frame(
+        became_removed = as.numeric(now$state_next == 3),
+        drug = d
+      )
+      k <- k + 1
+    }
+  }
+  bind_rows(out)
+}
+
+trans_blocks <- build_transmission_blocks(tracks, delta)
+recov_df     <- build_recovery_data(tracks, delta)
+
+cat("Number of (frame, condition) transmission blocks:", length(trans_blocks), "\n")
+cat("Number of recovery observations:", nrow(recov_df), "\n")
+
+## -------------------------------------------------------------------------
+## 3. Negative log-likelihood
+## -------------------------------------------------------------------------
+nll <- function(log_beta1, log_phi, betaD, log_gamma, gammaD) {
+
+  beta1 <- exp(log_beta1)
+  phi   <- exp(log_phi)
+  gamma <- exp(log_gamma)
+
+  ## --- transmission log-likelihood ---
+  ll_trans <- 0
+  for (blk in trans_blocks) {
+    kappa_sum <- rowSums(exp(-blk$D / phi))
+    lambda    <- beta1 * exp(betaD * blk$drug) * kappa_sum
+    p_inf     <- 1 - exp(-lambda * delta)
+    p_inf     <- pmin(pmax(p_inf, 1e-10), 1 - 1e-10)
+    ll_trans  <- ll_trans + sum(dbinom(blk$became_infected, 1, p_inf, log = TRUE))
+  }
+
+  ## --- recovery log-likelihood ---
+  p_rec <- 1 - exp(-gamma * exp(gammaD * recov_df$drug) * delta)
+  p_rec <- pmin(pmax(p_rec, 1e-10), 1 - 1e-10)
+  ll_rec <- sum(dbinom(recov_df$became_removed, 1, p_rec, log = TRUE))
+
+  -(ll_trans + ll_rec)
+}
+
+## -------------------------------------------------------------------------
+## 4. Fit
+## -------------------------------------------------------------------------
+## Reasonable starting values: eyeball beta1 from crude early growth rate,
+## phi from grid spacing (e.g. ~ a few cell-widths), gamma from mean
+## infectious-period length. Adjust these if optimizer struggles.
+start_vals <- list(
+  log_beta1 = log(0.01),
+  log_phi   = log(3),
+  betaD     = 0,
+  log_gamma = log(0.02),
+  gammaD    = 0
+)
+
+fit <- mle2(nll, start = start_vals, method = "BFGS",
+            control = list(maxit = 500))
+
+summary(fit)
+ci <- confint(fit)
+print(ci)
+
+## -------------------------------------------------------------------------
+## 5. Interpret results
+## -------------------------------------------------------------------------
+est <- coef(fit)
+
+cat("\n--- Rate of infection ---\n")
+cat("beta1 (baseline transmission rate, per frame):", exp(est["log_beta1"]), "\n")
+
+cat("\n--- Spatial range of infection ---\n")
+cat("phi (kernel decay distance, grid units):", exp(est["log_phi"]), "\n")
+
+cat("\n--- Drug effect on transmission ---\n")
+cat("betaD:", est["betaD"],
+    " (exp(betaD) =", exp(est["betaD"]), "x change in transmission rate)\n")
+cat("95% CI for betaD:", ci["betaD", ], "\n")
+cat("--> CI excludes 0:", !(ci["betaD", 1] < 0 & ci["betaD", 2] > 0), "\n")
+
+cat("\n--- Drug effect on recovery ---\n")
+cat("gammaD:", est["gammaD"],
+    " (exp(gammaD) =", exp(est["gammaD"]), "x change in recovery rate)\n")
+cat("95% CI for gammaD:", ci["gammaD", ], "\n")
+
+## -------------------------------------------------------------------------
+## 6. Visual check: fitted kernel shape
+## -------------------------------------------------------------------------
+library(ggplot2)
+
+d_seq <- seq(0, 20, length.out = 200)
+kernel_df <- data.frame(
+  d = d_seq,
+  kappa = exp(-d_seq / exp(est["log_phi"]))
+)
+
+ggplot(kernel_df, aes(d, kappa)) +
+  geom_line() +
+  labs(x = "Distance between cells (grid units)",
+       y = "Relative transmission weight",
+       title = "Fitted spatial transmission kernel") +
+  theme_minimal()
+
+## -------------------------------------------------------------------------
+## 7. Posterior predictive check: simulate and compare epidemic curves
+## -------------------------------------------------------------------------
+simulate_epidemic <- function(tracks_template, params, delta = 1) {
+  # tracks_template: one condition's (cell, frame, x, y) skeleton, with
+  # initial states at frame 1, used to re-simulate forward under the fit
+  frames <- sort(unique(tracks_template$frame))
+  state  <- tracks_template %>% filter(frame == frames[1]) %>%
+    select(cell, x, y, state)
+
+  sim_states <- list(state)
+
+  for (t in frames[-length(frames)]) {
+    coords_now <- tracks_template %>% filter(frame == t) %>% select(cell, x, y)
+    state <- state %>% select(-x, -y) %>% left_join(coords_now, by = "cell")
+
+    susc <- state %>% filter(state == 1)
+    inf  <- state %>% filter(state == 2)
+
+    if (nrow(susc) > 0 && nrow(inf) > 0) {
+      D <- sqrt(outer(susc$x, inf$x, "-")^2 + outer(susc$y, inf$y, "-")^2)
+      kappa_sum <- rowSums(exp(-D / params["phi"]))
+      lambda <- params["beta1"] * exp(params["betaD"] * unique(tracks_template$drug)) * kappa_sum
+      p_inf  <- 1 - exp(-lambda * delta)
+      newly_infected <- susc$cell[runif(nrow(susc)) < p_inf]
+      state$state[state$cell %in% newly_infected] <- 2
+    }
+
+    infd <- state %>% filter(state == 2)
+    if (nrow(infd) > 0) {
+      p_rec <- 1 - exp(-params["gamma"] * exp(params["gammaD"] * unique(tracks_template$drug)) * delta)
+      newly_removed <- infd$cell[runif(nrow(infd)) < p_rec]
+      state$state[state$cell %in% newly_removed] <- 3
+    }
+
+    sim_states[[length(sim_states) + 1]] <- state
+    state$frame <- t + delta
+  }
+
+  bind_rows(sim_states)
+}
+
+# Example: compare observed vs simulated I(t) curve for one condition
+# params <- c(beta1 = exp(est["log_beta1"]), phi = exp(est["log_phi"]),
+#             betaD = est["betaD"], gamma = exp(est["log_gamma"]), gammaD = est["gammaD"])
+# sim <- replicate(20, simulate_epidemic(df_before, params, delta), simplify = FALSE)
+# (then plot mean +/- range of simulated I(t) against observed I(t))
 ```
+
+
+
+```{r}
+## =========================================================================
+## Spatial SIR hazard model for cell-tracking data (before/after drug)
+## =========================================================================
+## Expected input: two data.frames, each with columns
+##   cell        : cell ID (1..161)
+##   frame       : 1..401
+##   t_min       : seq(0, 200, 0.5)
+##   x, y        : coordinates
+##   state       : 1 = S, 2 = I, 3 = R
+##   state_label : text label (not used in fitting)
+##
+## Model:
+##   lambda_i(t) = beta1 * exp(betaD * drug) * sum_{j in I(t)} exp(-d_ij(t)/phi)
+##   P(S_i -> I_i in [t, t+delta)) = 1 - exp(-lambda_i(t) * delta)
+##   P(I_i -> R_i in [t, t+delta)) = 1 - exp(-gamma * exp(gammaD * drug) * delta)
+## =========================================================================
+
+library(dplyr)
+library(bbmle)
+
+## -------------------------------------------------------------------------
+## 0. Load and stack the two datasets
+## -------------------------------------------------------------------------
+ df_before <- read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_no_drug_0.csv")
+ df_after  <- read.csv("/Applications/mism-hackathon/project/cell-infection/results/trajectory_with_drug_0.csv")
+
+df_before$drug <- 0
+df_after$drug  <- 1
+
+tracks <- bind_rows(df_before, df_after) %>%
+  arrange(drug, cell, frame)
+
+delta <- 1   # 1 frame = 0.5 min; hazard/rate parameters will be in units of "per frame"
+
+## -------------------------------------------------------------------------
+## 1. Precompute, for every (drug condition, frame), the distance matrix
+##    between susceptible cells and infected cells, plus the outcome
+##    (did each susceptible cell become infected by the next frame?)
+##    Distances don't depend on model parameters, so this is done ONCE.
+## -------------------------------------------------------------------------
+build_transmission_blocks <- function(tracks, delta = 1) {
+  blocks <- list()
+  k <- 1
+
+  for (d in unique(tracks$drug)) {
+    sub <- tracks %>% filter(drug == d)
+    frames <- sort(unique(sub$frame))
+
+    for (t in frames) {
+      if (!(t + delta) %in% frames) next
+
+      now <- sub %>% filter(frame == t)
+      nxt <- sub %>% filter(frame == t + delta) %>% select(cell, state_next = state)
+
+      susc <- now %>% filter(state == 1) %>% left_join(nxt, by = "cell")
+      inf  <- now %>% filter(state == 2)
+
+      if (nrow(susc) == 0 || nrow(inf) == 0) next
+
+      D <- sqrt(outer(susc$x, inf$x, "-")^2 + outer(susc$y, inf$y, "-")^2)
+      # D: rows = susceptible cells, cols = currently infected cells
+
+      blocks[[k]] <- list(
+        D = D,
+        became_infected = as.numeric(susc$state_next == 2),
+        drug = d
+      )
+      k <- k + 1
+    }
+  }
+  blocks
+}
+
+## -------------------------------------------------------------------------
+## 2. Recovery data (I -> R), no distance needed
+## -------------------------------------------------------------------------
+build_recovery_data <- function(tracks, delta = 1) {
+  out <- list()
+  k <- 1
+
+  for (d in unique(tracks$drug)) {
+    sub <- tracks %>% filter(drug == d)
+    frames <- sort(unique(sub$frame))
+
+    for (t in frames) {
+      if (!(t + delta) %in% frames) next
+
+      now <- sub %>% filter(frame == t, state == 2)
+      nxt <- sub %>% filter(frame == t + delta) %>% select(cell, state_next = state)
+      if (nrow(now) == 0) next
+
+      now <- now %>% left_join(nxt, by = "cell")
+      out[[k]] <- data.frame(
+        became_removed = as.numeric(now$state_next == 3),
+        drug = d
+      )
+      k <- k + 1
+    }
+  }
+  bind_rows(out)
+}
+
+trans_blocks <- build_transmission_blocks(tracks, delta)
+recov_df     <- build_recovery_data(tracks, delta)
+
+cat("Number of (frame, condition) transmission blocks:", length(trans_blocks), "\n")
+cat("Number of recovery observations:", nrow(recov_df), "\n")
+
+## -------------------------------------------------------------------------
+## 3. Negative log-likelihood
+## -------------------------------------------------------------------------
+nll <- function(log_beta1, log_phi, betaD, log_gamma, gammaD) {
+
+  beta1 <- exp(log_beta1)
+  phi   <- exp(log_phi)
+  gamma <- exp(log_gamma)
+
+  ## --- transmission log-likelihood ---
+  ll_trans <- 0
+  for (blk in trans_blocks) {
+    kappa_sum <- rowSums(exp(-blk$D / phi))
+    lambda    <- beta1 * exp(betaD * blk$drug) * kappa_sum
+    p_inf     <- 1 - exp(-lambda * delta)
+    p_inf     <- pmin(pmax(p_inf, 1e-10), 1 - 1e-10)
+    ll_trans  <- ll_trans + sum(dbinom(blk$became_infected, 1, p_inf, log = TRUE))
+  }
+
+  ## --- recovery log-likelihood ---
+  p_rec <- 1 - exp(-gamma * exp(gammaD * recov_df$drug) * delta)
+  p_rec <- pmin(pmax(p_rec, 1e-10), 1 - 1e-10)
+  ll_rec <- sum(dbinom(recov_df$became_removed, 1, p_rec, log = TRUE))
+
+  -(ll_trans + ll_rec)
+}
+
+## -------------------------------------------------------------------------
+## 4. Fit
+## -------------------------------------------------------------------------
+## Reasonable starting values: eyeball beta1 from crude early growth rate,
+## phi from grid spacing (e.g. ~ a few cell-widths), gamma from mean
+## infectious-period length. Adjust these if optimizer struggles.
+start_vals <- list(
+  log_beta1 = log(0.01),
+  log_phi   = log(3),
+  betaD     = 0,
+  log_gamma = log(0.02),
+  gammaD    = 0
+)
+
+fit <- mle2(nll, start = start_vals, method = "BFGS",
+            control = list(maxit = 500))
+
+summary(fit)
+ci <- confint(fit)
+print(ci)
+
+## -------------------------------------------------------------------------
+## 5. Interpret results
+## -------------------------------------------------------------------------
+est <- coef(fit)
+
+cat("\n--- Rate of infection ---\n")
+cat("beta1 (baseline transmission rate, per frame):", exp(est["log_beta1"]), "\n")
+
+cat("\n--- Spatial range of infection ---\n")
+cat("phi (kernel decay distance, grid units):", exp(est["log_phi"]), "\n")
+
+cat("\n--- Drug effect on transmission ---\n")
+cat("betaD:", est["betaD"],
+    " (exp(betaD) =", exp(est["betaD"]), "x change in transmission rate)\n")
+cat("95% CI for betaD:", ci["betaD", ], "\n")
+cat("--> CI excludes 0:", !(ci["betaD", 1] < 0 & ci["betaD", 2] > 0), "\n")
+
+cat("\n--- Drug effect on recovery ---\n")
+cat("gammaD:", est["gammaD"],
+    " (exp(gammaD) =", exp(est["gammaD"]), "x change in recovery rate)\n")
+cat("95% CI for gammaD:", ci["gammaD", ], "\n")
+
+## -------------------------------------------------------------------------
+## 6. Visual check: fitted kernel shape
+## -------------------------------------------------------------------------
+library(ggplot2)
+
+d_seq <- seq(0, 20, length.out = 200)
+kernel_df <- data.frame(
+  d = d_seq,
+  kappa = exp(-d_seq / exp(est["log_phi"]))
+)
+
+ggplot(kernel_df, aes(d, kappa)) +
+  geom_line() +
+  labs(x = "Distance between cells (grid units)",
+       y = "Relative transmission weight",
+       title = "Fitted spatial transmission kernel") +
+  theme_minimal()
+
+## -------------------------------------------------------------------------
+## 7. Posterior predictive check: simulate and compare epidemic curves
+## -------------------------------------------------------------------------
+simulate_epidemic <- function(tracks_template, params, delta = 1) {
+  # tracks_template: one condition's (cell, frame, x, y) skeleton, with
+  # initial states at frame 1, used to re-simulate forward under the fit
+  frames <- sort(unique(tracks_template$frame))
+  state  <- tracks_template %>% filter(frame == frames[1]) %>%
+    select(cell, x, y, state)
+
+  sim_states <- list(state)
+
+  for (t in frames[-length(frames)]) {
+    coords_now <- tracks_template %>% filter(frame == t) %>% select(cell, x, y)
+    state <- state %>% select(-x, -y) %>% left_join(coords_now, by = "cell")
+
+    susc <- state %>% filter(state == 1)
+    inf  <- state %>% filter(state == 2)
+
+    if (nrow(susc) > 0 && nrow(inf) > 0) {
+      D <- sqrt(outer(susc$x, inf$x, "-")^2 + outer(susc$y, inf$y, "-")^2)
+      kappa_sum <- rowSums(exp(-D / params["phi"]))
+      lambda <- params["beta1"] * exp(params["betaD"] * unique(tracks_template$drug)) * kappa_sum
+      p_inf  <- 1 - exp(-lambda * delta)
+      newly_infected <- susc$cell[runif(nrow(susc)) < p_inf]
+      state$state[state$cell %in% newly_infected] <- 2
+    }
+
+    infd <- state %>% filter(state == 2)
+    if (nrow(infd) > 0) {
+      p_rec <- 1 - exp(-params["gamma"] * exp(params["gammaD"] * unique(tracks_template$drug)) * delta)
+      newly_removed <- infd$cell[runif(nrow(infd)) < p_rec]
+      state$state[state$cell %in% newly_removed] <- 3
+    }
+
+    sim_states[[length(sim_states) + 1]] <- state
+    state$frame <- t + delta
+  }
+
+  bind_rows(sim_states)
+}
+
+# Example: compare observed vs simulated I(t) curve for one condition
+# params <- c(beta1 = exp(est["log_beta1"]), phi = exp(est["log_phi"]),
+#             betaD = est["betaD"], gamma = exp(est["log_gamma"]), gammaD = est["gammaD"])
+# sim <- replicate(20, simulate_epidemic(df_before, params, delta), simplify = FALSE)
+# (then plot mean +/- range of simulated I(t) against observed I(t))
+```
+
+```{r}
+library(mcmc)
+
+## -------------------------------------------------------------------------
+## 1. Log-posterior = log-likelihood + log-prior
+##    (weakly informative priors on the log/natural scale)
+## -------------------------------------------------------------------------
+log_posterior <- function(par) {
+  log_beta1 <- par[1]; log_phi <- par[2]; betaD <- par[3]
+  log_gamma <- par[4]; gammaD <- par[5]
+
+  ll <- -nll(log_beta1, log_phi, betaD, log_gamma, gammaD)  # reuse existing nll
+
+  # weakly informative priors: keeps parameters in a plausible range
+  # without dominating the likelihood
+  lp <- dnorm(log_beta1, mean = log(0.01), sd = 3, log = TRUE) +
+        dnorm(log_phi,   mean = log(3),    sd = 3, log = TRUE) +
+        dnorm(betaD,     mean = 0,         sd = 5, log = TRUE) +
+        dnorm(log_gamma, mean = log(0.02), sd = 3, log = TRUE) +
+        dnorm(gammaD,    mean = 0,         sd = 5, log = TRUE)
+
+  ll + lp
+}
+
+## -------------------------------------------------------------------------
+## 2. Initialize at the MLE, use its covariance to scale proposals
+##    (this is the "easy" trick that makes plain Metropolis work well
+##    without hand-tuning a proposal covariance from scratch)
+## -------------------------------------------------------------------------
+init <- coef(fit)                 # from the mle2 fit you already ran
+Sigma <- vcov(fit)                # MLE covariance -> good proposal shape
+
+## -------------------------------------------------------------------------
+## 3. Run Metropolis-Hastings
+## -------------------------------------------------------------------------
+out <- metrop(log_posterior, initial = init, nbatch = 5000,
+              scale = Sigma, blen = 1)
+
+cat("Acceptance rate:", out$accept, "\n")   # aim for ~0.2-0.4; rescale if not
+
+out2 <- metrop(out, scale = Sigma * 8)   # try a multiplier, adjust as needed
+cat("Acceptance rate:", out2$accept, "\n")
+
+# if still too high, scale up more; if it overshoots below ~0.2, scale back down
+out3 <- metrop(out2, scale = Sigma * 8)
+cat("Acceptance rate:", out3$accept, "\n")
+
+out = out2
+# if acceptance is too low/high, rerun with a scaled proposal, e.g.:
+# out <- metrop(out, scale = Sigma * 0.5)   # shrink
+# out <- metrop(out, scale = Sigma * 2)     # grow
+
+## -------------------------------------------------------------------------
+## 4. Posterior summaries
+## -------------------------------------------------------------------------
+post <- as.data.frame(out$batch)
+colnames(post) <- c("log_beta1", "log_phi", "betaD", "log_gamma", "gammaD")
+
+post$beta1 <- exp(post$log_beta1)
+post$phi   <- exp(post$log_phi)
+post$gamma <- exp(post$log_gamma)
+
+burn <- 1:1000   # discard burn-in
+post <- post[-burn, ]
+
+summary(post[, c("beta1", "phi", "betaD", "gamma", "gammaD")])
+
+# 95% credible intervals
+apply(post[, c("beta1","phi","betaD","gamma","gammaD")], 2,
+      quantile, probs = c(0.025, 0.975))
+```
+
+
+
+
+## Model Checking
+
+```{r}
+library(dplyr)
+
+check_calibration <- function(trans_blocks, params, n_bins = 10) {
+  all_p <- c(); all_y <- c()
+
+  for (blk in trans_blocks) {
+    kappa_sum <- rowSums(exp(-blk$D / params["phi"]))
+    lambda <- params["beta1"] * exp(params["betaD"] * blk$drug) * kappa_sum
+    p <- 1 - exp(-lambda * 1)  # delta = 1 frame
+    all_p <- c(all_p, p)
+    all_y <- c(all_y, blk$became_infected)
+  }
+
+  df <- data.frame(p = all_p, y = all_y) %>%
+    mutate(bin = ntile(p, n_bins)) %>%
+    group_by(bin) %>%
+    summarise(mean_pred = mean(p), mean_obs = mean(y), n = n())
+
+  plot(df$mean_pred, df$mean_obs, xlim = c(0,1), ylim = c(0,1),
+       xlab = "Mean predicted probability", ylab = "Observed frequency")
+  abline(0, 1, col = "red")
+  df
+}
+
+## Build the params vector from your mle2 fit
+est <- coef(fit)
+params <- c(
+  beta1 = exp(est["log_beta1"]),
+  phi   = exp(est["log_phi"]),
+  betaD = est["betaD"]
+)
+
+## Run the calibration check on the transmission blocks you already built
+calib_df <- check_calibration(trans_blocks, params, n_bins = 10)
+
+## Inspect the table: mean_pred vs mean_obs should track closely per bin
+print(calib_df)
+
+
+check_calibration_recovery <- function(recov_df, params, n_bins = 10) {
+  p <- 1 - exp(-params["gamma"] * exp(params["gammaD"] * recov_df$drug) * 1)
+
+  df <- data.frame(p = p, y = recov_df$became_removed) %>%
+    mutate(bin = ntile(p, n_bins)) %>%
+    group_by(bin) %>%
+    summarise(mean_pred = mean(p), mean_obs = mean(y), n = n())
+
+  plot(df$mean_pred, df$mean_obs, xlim = c(0,1), ylim = c(0,1),
+       xlab = "Mean predicted probability", ylab = "Observed frequency",
+       main = "Recovery calibration")
+  abline(0, 1, col = "red")
+  df
+}
+
+params_recov <- c(gamma = exp(est["log_gamma"]), gammaD = est["gammaD"])
+calib_recov_df <- check_calibration_recovery(recov_df, params_recov)
+
+library(coda)
+
+mcmc_obj <- as.mcmc(out$batch)
+plot(mcmc_obj)             # trace + density plots — check for good mixing, no drift
+effectiveSize(mcmc_obj)    # want this reasonably close to nbatch, not tiny
+geweke.diag(mcmc_obj)      # |z| < ~2 for each parameter suggests convergence
+```
+
+
+
+```{r}
+# Simulate many full epidemics under posterior draws (or MLE point estimate),
+# using the simulate_epidemic() function from before
+sim_curves <- function(tracks_template, post, n_sims = 50, delta = 1) {
+  results <- list()
+  for (s in 1:n_sims) {
+    draw <- post[sample(nrow(post), 1), ]
+    params <- c(beta1 = draw$beta1, phi = draw$phi,
+                betaD = draw$betaD, gamma = draw$gamma, gammaD = draw$gammaD)
+    sim <- simulate_epidemic(tracks_template, params, delta)
+    curve <- sim %>% group_by(frame) %>%
+      summarise(I = sum(state == 2), .groups = "drop")
+    curve$sim_id <- s
+    results[[s]] <- curve
+  }
+  bind_rows(results)
+}
+
+sims <- sim_curves(df_before, post, n_sims = 50)
+
+obs <- df_before %>% group_by(frame) %>% summarise(I = sum(state == 2))
+
+library(ggplot2)
+ggplot() +
+  geom_line(data = sims, aes(frame, I, group = sim_id), alpha = 0.1, color = "steelblue") +
+  geom_line(data = obs, aes(frame, I), color = "black", linewidth = 1) +
+  labs(title = "Observed (black) vs simulated (blue) I(t) curves")
+```
+
+```{r}
+## -------------------------------------------------------------------------
+## Simulate from a single fixed parameter set (the MLE), repeated n_sims times
+## -------------------------------------------------------------------------
+sim_curves_mle <- function(tracks_template, params, n_sims = 50, delta = 1) {
+  results <- list()
+  for (s in 1:n_sims) {
+    sim <- simulate_epidemic(tracks_template, params, delta)
+    curve <- sim %>% group_by(frame) %>%
+      summarise(I = sum(state == 2), .groups = "drop")
+    curve$sim_id <- s
+    results[[s]] <- curve
+  }
+  bind_rows(results)
+}
+
+## Build the fixed parameter vector from your mle2 fit
+est <- coef(fit)
+params_mle <- c(
+  beta1 = exp(est["log_beta1"]),
+  phi   = exp(est["log_phi"]),
+  betaD = est["betaD"],
+  gamma = exp(est["log_gamma"]),
+  gammaD = est["gammaD"]
+)
+
+## Run
+sims <- sim_curves_mle(df_before, params_mle, n_sims = 50)
+
+## Plot against observed, same as before
+obs <- df_before %>% group_by(frame) %>% summarise(I = sum(state == 2))
+
+library(ggplot2)
+ggplot() +
+  geom_line(data = sims, aes(frame, I, group = sim_id), alpha = 0.1, color = "steelblue") +
+  geom_line(data = obs, aes(frame, I), color = "black", linewidth = 1) +
+  labs(title = "Observed (black) vs simulated (blue) I(t) curves — MLE point estimate")
+```
+
+
+```{r}
+sims <- sim_curves(df_after, post, n_sims = 50)
+
+obs <- df_after %>% group_by(frame) %>% summarise(I = sum(state == 2))
+
+library(ggplot2)
+ggplot() +
+  geom_line(data = sims, aes(frame, I, group = sim_id), alpha = 0.1, color = "steelblue") +
+  geom_line(data = obs, aes(frame, I), color = "black", linewidth = 1) +
+  labs(title = "Observed (black) vs simulated (blue) I(t) curves")
+
+
+library(dplyr)
+
+infectious_periods <- tracks %>%
+  filter(state %in% c(2,3)) %>%
+  group_by(cell, drug) %>%
+  summarise(
+    start = min(t_min[state == 2]),
+    end   = min(t_min[state == 3], default = NA),
+    .groups = "drop"
+  ) %>%
+  mutate(duration = end - start) %>%
+  filter(!is.na(duration))
+
+hist(infectious_periods$duration, breaks = 30)
+mean(infectious_periods$duration); sd(infectious_periods$duration)
+```
+
 
