@@ -23,3 +23,6 @@ project/**/results/*.json
 
 # ---- OS ----
 .DS_Store
+
+# agent working dir
+.claude/
